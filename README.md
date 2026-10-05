@@ -17,21 +17,28 @@ as tags "Ano 2026" hoje trazem candidatos, eleitorado etc.; os resultados
 consolidados entram alguns dias após cada turno. A apuração ao vivo vem dos JSONs
 públicos que o próprio app do TSE consome, e é isso que `coletor.py` lê.
 
-Estrutura dos endpoints (veja `src/deolhonovoto/tse.py`):
+Endpoints (validados em 05/10/2026; veja `src/deolhonovoto/tse.py`):
 
 ```
-/oficial/comum/config/ele-c.json                                   -> eleições e turnos
-/oficial/ele2026/6257/config/mun-e006257-cm.json                   -> municípios
-/oficial/ele2026/6257/dados-simplificados/br/br-c0001-e006257-r.json        -> Brasil
-/oficial/ele2026/6257/dados-simplificados/sp/sp-c0001-e006257-r.json        -> UF
-/oficial/ele2026/6257/dados-simplificados/sp/sp71072-c0001-e006257-r.json   -> município
+/oficial/comum/config/ele-c.json                                  -> eleições, turnos e código do 2T (cdt2)
+/oficial/ele2026/6257/config/mun-e006257-cm.json                  -> municípios (TSE, IBGE, capital, zonas)
+/oficial/ele2026/6257/dados/sp/sp-e006257-ab.json                 -> progresso de cada município da UF
+/oficial/ele2026/6257/dados/br/br-c0001-e006257-u.json            -> Brasil
+/oficial/ele2026/6257/dados/sp/sp-c0001-e006257-u.json            -> UF
+/oficial/ele2026/6257/dados/sp/sp71072-c0001-e006257-u.json       -> município (UF + código TSE)
 ```
 
-`6257` é o código da eleição que aparece na URL do app (`#/eleicao/6257/...`);
-`c0001` é o cargo (1 = Presidente, 3 = Governador, 5 = Senador). Os endpoints
-não são documentados oficialmente: antes da noite do 2T, confira no DevTools do
-navegador (aba *Network*) se os caminhos continuam iguais e qual é o código da
-eleição do 2º turno (também listado por `coletor eleicoes`).
+Códigos de 2026 (de `coletor eleicoes`):
+
+| Eleição | 1º turno | 2º turno |
+|---|---|---|
+| Federal (Presidente) | 6257 | 6258 |
+| Estadual (Governador, Senador, Deputados) | 6259 | 6260 |
+
+`c0001` é o cargo (1 = Presidente, 3 = Governador, 5 = Senador). O 2º turno
+(6258) ainda devolve 404: o TSE publica a configuração perto da data; o
+`monitorar` espera e tenta de novo sozinho. Os arquivos têm ETag, então
+rodadas seguidas só baixam o que mudou.
 
 ## Instalação
 
@@ -46,34 +53,50 @@ pytest
 ### 1. Agora: guardar o 1º turno por município
 
 ```bash
-python -m deolhonovoto.coletor eleicoes                 # lista códigos de eleição/turno
-python -m deolhonovoto.coletor coletar --eleicao 6257 --niveis br,uf,mu
+python -m deolhonovoto.coletor eleicoes            # lista códigos de eleição/turno
+python -m deolhonovoto.coletor coletar --eleicao 6257
 ```
 
-São ~5.600 arquivos (5.570 municípios + exterior); com concorrência 16 leva poucos
-minutos. Tudo é gravado em `data/` (bruto em `.json.gz` + parquet normalizado).
+São 5.786 arquivos (BR + 27 UFs + exterior + 5.757 municípios, sendo 186 cidades
+no exterior), ~1 minuto. A soma dos municípios bate exatamente com o total
+Brasil (eleitorado, comparecimento, válidos, brancos, nulos e votos por
+candidato). Tudo vai para `data/` (bruto em `.json.gz` + parquet normalizado).
 
-### 2. Treinar/validar com 2022 (Lula 13 × Bolsonaro 22)
+### 2. Validar com 2022 (Lula 13 × Bolsonaro 22)
 
 ```bash
 python -m deolhonovoto.dadosabertos 2022
 python -m deolhonovoto.projetar backtest --ano 2022 --a 13 --b 22
 ```
 
-O backtest simula uma apuração com o viés regional típico (Sul/Sudeste primeiro,
-Norte/Nordeste e exterior depois) e compara o placar parcial com a projeção.
+O backtest usa o horário real de totalização de cada zona eleitoral
+(`detalhe_votacao_munzona`) para reproduzir a ordem da noite do 2T de 2022.
+Resultado (Lula terminou com 50,90%):
+
+| Horário | % apurado | Placar parcial | Projeção | IC 90% |
+|---|---|---|---|---|
+| 17:45 | 1,3% | 55,14% | 50,55% | 50,12–50,99 |
+| 18:15 | 5,0% | 51,81% | 50,73% | 50,52–50,93 |
+| 18:45 | 16,3% | 50,04% | 51,03% | 50,87–51,19 |
+| 19:30 | 63,0% | 50,09% | 50,99% | 50,88–51,10 |
+| 20:15 | 86,8% | 50,64% | 50,94% | 50,91–50,97 |
+
+Ressalva: no replay cada zona entra inteira no horário da sua *última*
+totalização, o que é mais grosseiro que a noite real (seção a seção). Os
+snapshots coletados ao vivo em 2026 permitem um backtest exato.
 
 ### 3. Noite do 2º turno
 
 ```bash
-# terminal 1: coleta contínua (BR/UFs a cada 60s, municípios a cada 180s)
-python -m deolhonovoto.coletor monitorar --eleicao <codigo-2T> --intervalo 60 --intervalo-municipios 180
+# terminal 1: coleta contínua; a cada 30s baixa BR, UFs e o progresso por UF,
+# e só os municípios cujo nº de seções totalizadas mudou
+python -m deolhonovoto.coletor monitorar --eleicao 6258 --intervalo 30
 
 # terminal 2: projeção atualizada a cada 60s
-python -m deolhonovoto.projetar ao-vivo --eleicao-1t 6257 --eleicao-2t <codigo-2T> --a <num> --b <num> --loop 60
+python -m deolhonovoto.projetar ao-vivo --eleicao-1t 6257 --eleicao-2t 6258 --a 13 --b 22 --loop 60
 ```
 
-Saída: `apurado ~35% | parcial A 47.1% | projeção A 50.8% (IC90 50.1-51.5) | P(A vence) 98%`.
+Saída: `apurado ~35% | parcial 13 47.1% | projeção 13 50.8% (IC90 50.1-51.5) | P(13 vence) 98%`.
 
 ## O modelo (`nowcast.py`)
 

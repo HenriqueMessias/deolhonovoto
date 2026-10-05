@@ -1,11 +1,15 @@
 """Replays de apuração para backtest do nowcast.
 
-Os arquivos de dados abertos só trazem o resultado final; não dizem em que
-ordem as urnas foram apuradas. Para testar o modelo com eleições passadas,
-simulamos uma apuração com viés regional parecido com o observado no Brasil
-(Sul/Sudeste/Centro-Oeste e capitais tendem a andar mais rápido; Norte/Nordeste
-e o exterior chegam mais tarde). Com os snapshots reais coletados em 2026, o
-backtest pode usar a ordem verdadeira (ver `dados.estado_municipal(..., ate=...)`).
+Duas formas de reproduzir uma noite de apuração:
+
+* `estado_real`: usa o horário da última totalização de cada zona eleitoral
+  (dados abertos, `detalhe_votacao_munzona`). Cada zona entra inteira no
+  instante em que terminou: é a ordem *real* da noite, com granularidade de zona.
+* `estado_parcial`: ordem sintética com viés regional (Sul/Sudeste primeiro,
+  Norte/Nordeste e exterior depois), útil para testes sem dados reais.
+
+Com os snapshots coletados ao vivo em 2026, dá para usar a sequência exata
+(ver `dados.estado_municipal(..., ate=...)`).
 """
 
 from __future__ import annotations
@@ -42,21 +46,57 @@ def estado_parcial(final: pd.DataFrame, inicio: np.ndarray, tau: float, duracao:
     return parcial
 
 
-def backtest(t1: pd.DataFrame, t2: pd.DataFrame, a: str, b: str, seed: int = 0,
-             taus=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0)) -> pd.DataFrame:
+def estado_real(zonas: pd.DataFrame, instante: pd.Timestamp) -> pd.DataFrame:
+    """Estado por município no `instante`, somando as zonas já totalizadas.
+
+    `pct_secoes_totalizadas` é aproximado pela fração do eleitorado do município
+    nas zonas já totalizadas.
+    """
+    chave = ["uf", "cd_municipio_tse"]
+    cols = [c for c in zonas.columns if c.startswith("v_")] + [
+        "comparecimento", "votos_validos", "votos_brancos", "votos_nulos"]
+    pronta = (zonas["totalizado_em"] <= instante).to_numpy()
+    parcial = zonas[cols].mul(pronta, axis=0)
+    parcial[chave] = zonas[chave]
+    parcial["eleit_pronto"] = zonas["eleitorado"] * pronta
+    parcial["eleitorado"] = zonas["eleitorado"]
+    df = parcial.groupby(chave, as_index=False).sum()
+    df["pct_secoes_totalizadas"] = 100 * df["eleit_pronto"] / df["eleitorado"].clip(lower=1)
+    return df.drop(columns=["eleit_pronto"])
+
+
+def _avaliar(t1: pd.DataFrame, final: pd.DataFrame, a: str, b: str, estados, seed: int = 0) -> pd.DataFrame:
+    """Roda o nowcast em cada (rótulo, estado parcial) e compara com o resultado final."""
     from .nowcast import projetar
 
-    chave = ["uf", "cd_municipio_tse"]
-    t2 = t2.merge(t1[chave], on=chave)
-    final_a = 100 * t2[f"v_{a}"].sum() / (t2[f"v_{a}"].sum() + t2[f"v_{b}"].sum())
-    inicio = inicio_apuracao(t2, seed)
+    final_a = 100 * final[f"v_{a}"].sum() / (final[f"v_{a}"].sum() + final[f"v_{b}"].sum())
     linhas = []
-    for tau in taus:
-        p = projetar(t1, estado_parcial(t2, inicio, tau), a, b, seed=seed)
+    for rotulo, parcial in estados:
+        p = projetar(t1, parcial, a, b, seed=seed)
         linhas.append({
-            "tau": tau, "pct_apurado": p.pct_votos_apurados, "parcial_a": p.pct_a_parcial,
+            "momento": rotulo, "pct_apurado": p.pct_votos_apurados, "parcial_a": p.pct_a_parcial,
             "projecao_a": p.pct_a, "ic90_inf": p.ic90[0], "ic90_sup": p.ic90[1],
             "prob_a": p.prob_a_vence, "final_a": final_a,
             "erro_parcial": p.pct_a_parcial - final_a, "erro_projecao": p.pct_a - final_a,
         })
     return pd.DataFrame(linhas)
+
+
+def backtest(t1: pd.DataFrame, t2: pd.DataFrame, a: str, b: str, seed: int = 0,
+             taus=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0)) -> pd.DataFrame:
+    """Backtest com ordem de apuração sintética."""
+    chave = ["uf", "cd_municipio_tse"]
+    t2 = t2.merge(t1[chave], on=chave)
+    inicio = inicio_apuracao(t2, seed)
+    estados = ((tau, estado_parcial(t2, inicio, tau)) for tau in taus)
+    return _avaliar(t1, t2, a, b, estados, seed)
+
+
+def backtest_real(t1: pd.DataFrame, zonas_t2: pd.DataFrame, a: str, b: str,
+                  passo: str = "15min", seed: int = 0) -> pd.DataFrame:
+    """Backtest com a ordem real de totalização das zonas no 2º turno."""
+    inicio = zonas_t2["totalizado_em"].min().ceil(passo)
+    fim = zonas_t2["totalizado_em"].quantile(0.99)
+    instantes = pd.date_range(inicio, fim, freq=passo)
+    estados = ((t.strftime("%d/%m %H:%M"), estado_real(zonas_t2, t)) for t in instantes)
+    return _avaliar(t1, estado_real(zonas_t2, zonas_t2["totalizado_em"].max()), a, b, estados, seed)

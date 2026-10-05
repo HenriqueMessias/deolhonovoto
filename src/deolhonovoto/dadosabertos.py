@@ -63,19 +63,37 @@ def _num(df: pd.DataFrame, *candidatas: str) -> pd.Series:
     return pd.Series(0.0, index=df.index)
 
 
-def carregar_munzona(ano: int, turno: int, cargo: int = 1, data_dir: str | Path = "data") -> pd.DataFrame:
-    """Resultado final por município no formato largo (ver dados.py)."""
+CHAVE_ZONA = ["uf", "cd_municipio_tse", "zona"]
+TOTAIS = ["eleitorado", "comparecimento", "votos_brancos", "votos_nulos"]
+
+
+def carregar_zonas(ano: int, turno: int, cargo: int = 1, data_dir: str | Path = "data") -> pd.DataFrame:
+    """Resultado final por zona eleitoral (formato largo) + horário da última totalização.
+
+    O horário (`totalizado_em`, horário de Brasília) é o que permite reproduzir a
+    ordem real em que a apuração andou na noite da eleição. O resultado fica em
+    cache em parquet, porque ler o zip de ~640 MB demora.
+    """
     pasta = Path(data_dir) / "dadosabertos"
+    cache = pasta / f"zonas_{ano}_t{turno}_c{cargo:04d}.parquet"
+    if cache.exists():
+        return pd.read_parquet(cache)
+
     cand = _ler_csv_do_zip(pasta / f"votacao_candidato_munzona_{ano}.zip")
     det = _ler_csv_do_zip(pasta / f"detalhe_votacao_munzona_{ano}.zip")
 
     def filtrar(df):
-        return df[(df["NR_TURNO"].astype(int) == turno) & (df["CD_CARGO"].astype(int) == cargo)].copy()
+        df = df[(df["NR_TURNO"].astype(int) == turno) & (df["CD_CARGO"].astype(int) == cargo)].copy()
+        # um arquivo traz "1120", o outro "01120": normaliza p/ o código TSE de 5 dígitos
+        df["uf"] = df["SG_UF"]
+        df["cd_municipio_tse"] = df["CD_MUNICIPIO"].str.zfill(5)
+        df["zona"] = df["NR_ZONA"].str.zfill(4)
+        return df
 
     cand, det = filtrar(cand), filtrar(det)
     cand["votos"] = _num(cand, "QT_VOTOS_NOMINAIS_VALIDOS", "QT_VOTOS_NOMINAIS")
-    largo = cand.pivot_table(index=["SG_UF", "CD_MUNICIPIO"], columns="NR_CANDIDATO",
-                             values="votos", aggfunc="sum", fill_value=0)
+    largo = cand.pivot_table(index=CHAVE_ZONA, columns="NR_CANDIDATO", values="votos",
+                             aggfunc="sum", fill_value=0)
     largo.columns = [f"v_{c}" for c in largo.columns]
 
     det = det.assign(
@@ -83,13 +101,22 @@ def carregar_munzona(ano: int, turno: int, cargo: int = 1, data_dir: str | Path 
         comparecimento=_num(det, "QT_COMPARECIMENTO"),
         votos_brancos=_num(det, "QT_VOTOS_BRANCOS"),
         votos_nulos=_num(det, "QT_TOTAL_VOTOS_NULOS", "QT_VOTOS_NULOS"),
-    ).groupby(["SG_UF", "CD_MUNICIPIO"])[["eleitorado", "comparecimento", "votos_brancos", "votos_nulos"]].sum()
+        totalizado_em=pd.to_datetime(
+            det["DT_ULTIMA_TOTALIZACAO"] + " " + det["HH_ULTIMA_TOTALIZACAO"], dayfirst=True, errors="coerce"),
+    ).groupby(CHAVE_ZONA).agg({**{c: "sum" for c in TOTAIS}, "totalizado_em": "max"})
 
     df = det.join(largo, how="inner").reset_index()
     df["votos_validos"] = df.filter(like="v_").sum(axis=1)
+    df.to_parquet(cache, index=False)
+    return df
+
+
+def carregar_munzona(ano: int, turno: int, cargo: int = 1, data_dir: str | Path = "data") -> pd.DataFrame:
+    """Resultado final por município no formato largo (ver dados.py)."""
+    zonas = carregar_zonas(ano, turno, cargo, data_dir)
+    soma = TOTAIS + ["votos_validos"] + [c for c in zonas.columns if c.startswith("v_")]
+    df = zonas.groupby(["uf", "cd_municipio_tse"], as_index=False)[soma].sum()
     df["pct_secoes_totalizadas"] = 100.0
-    df = df.rename(columns={"SG_UF": "uf", "CD_MUNICIPIO": "cd_municipio_tse"})
-    df["cd_municipio_tse"] = df["cd_municipio_tse"].str.zfill(5)
     return df
 
 

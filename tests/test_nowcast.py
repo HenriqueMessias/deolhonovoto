@@ -26,3 +26,20 @@ def test_projecao_corrige_vies_da_parcial(sintetico):
     assert (meio.erro_projecao.abs() < 1.0).all()
     # o valor final cai dentro do IC90 na maior parte dos pontos
     assert ((meio.final_a >= meio.ic90_inf) & (meio.final_a <= meio.ic90_sup)).mean() >= 0.5
+
+
+def test_estado_real_soma_zonas_totalizadas():
+    import pandas as pd
+
+    from deolhonovoto.simulacao import estado_real
+
+    zonas = pd.DataFrame({
+        "uf": ["SP", "SP", "AC"], "cd_municipio_tse": ["71072", "71072", "01120"], "zona": ["0001", "0002", "0008"],
+        "eleitorado": [100, 300, 50], "comparecimento": [80, 240, 40], "votos_brancos": [1, 2, 1],
+        "votos_nulos": [1, 2, 1], "votos_validos": [78, 236, 38], "v_13": [40, 100, 30], "v_22": [38, 136, 8],
+        "totalizado_em": pd.to_datetime(["2022-10-30 18:00", "2022-10-30 20:00", "2022-10-30 19:00"]),
+    })
+    df = estado_real(zonas, pd.Timestamp("2022-10-30 19:30")).set_index("cd_municipio_tse")
+    assert df.loc["71072", "v_13"] == 40 and df.loc["71072", "pct_secoes_totalizadas"] == 25
+    assert df.loc["01120", "v_22"] == 8 and df.loc["01120", "pct_secoes_totalizadas"] == 100
+    assert df.loc["71072", "eleitorado"] == 400

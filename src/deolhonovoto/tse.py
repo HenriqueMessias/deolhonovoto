@@ -1,20 +1,23 @@
 """Cliente para os JSONs públicos de divulgação de resultados do TSE.
 
 O site https://resultados.tse.jus.br/oficial/app/ é uma SPA que lê arquivos JSON
-estáticos servidos pela CDN do próprio TSE. Os caminhos seguem o padrão:
+estáticos servidos pela CDN do próprio TSE. Caminhos (validados em 05/10/2026):
 
     {BASE}/comum/config/ele-c.json
-        -> pleitos e eleições disponíveis (códigos de eleição, turnos, datas)
+        -> pleitos e eleições (código, turno, `cdt2` = código do 2º turno)
     {BASE}/{ciclo}/{eleicao}/config/mun-e{eleicao:06d}-cm.json
-        -> lista de UFs e municípios (código TSE, código IBGE, nome, zonas)
-    {BASE}/{ciclo}/{eleicao}/dados-simplificados/{uf}/{arquivo}-c{cargo:04d}-e{eleicao:06d}-r.json
-        -> totais da abrangência (BR, UF ou município) + votos por candidato
+        -> UFs e municípios (código TSE, código IBGE, nome, capital, zonas)
+    {BASE}/{ciclo}/{eleicao}/dados/{uf}/{uf}-e{eleicao:06d}-ab.json
+        -> progresso de cada município da UF (seções totalizadas, hora); leve,
+           serve para saber quais municípios mudaram desde a última rodada
+    {BASE}/{ciclo}/{eleicao}/dados/{uf}/{abr}-c{cargo:04d}-e{eleicao:06d}-u.json
+        -> totais + votos por candidato da abrangência
 
-onde `ciclo` é "ele2026", `uf` é minúscula ("br", "sp", "zz" = exterior) e o
-arquivo é "br", "sp" ou "sp71072" (UF + código TSE do município).
+onde `ciclo` é "ele2026", `uf` é minúscula ("br", "sp", "zz" = exterior) e `abr`
+é "br", "sp" ou "sp71072" (UF + código TSE do município).
 
-Os números chegam como strings e os percentuais com vírgula decimal ("48,43").
-O parser abaixo é tolerante: campos ausentes viram NaN em vez de quebrar a coleta.
+Os números chegam como strings, com vírgula decimal ("47,03"). O parser é
+tolerante: campos ausentes viram NaN em vez de quebrar a coleta.
 """
 
 from __future__ import annotations
@@ -36,44 +39,39 @@ CARGO_PRESIDENTE = 1
 CARGO_GOVERNADOR = 3
 CARGO_SENADOR = 5
 
-# Campos de totais do arquivo "-r.json" (nome no JSON -> nome legível).
+# Totais do "-u.json": (bloco, chave no JSON) -> nome legível.
 CAMPOS_TOTAIS = {
-    "s": "secoes",
-    "st": "secoes_totalizadas",
-    "pst": "pct_secoes_totalizadas",
-    "e": "eleitorado",
-    "ea": "eleitorado_apurado",
-    "pea": "pct_eleitorado_apurado",
-    "c": "comparecimento",
-    "pc": "pct_comparecimento",
-    "a": "abstencao",
-    "pa": "pct_abstencao",
-    "vv": "votos_validos",
-    "pvv": "pct_votos_validos",
-    "vb": "votos_brancos",
-    "pvb": "pct_votos_brancos",
-    "tvn": "votos_nulos",
-    "ptvn": "pct_votos_nulos",
-    "van": "votos_anulados",
-    "tv": "total_votos",
+    ("s", "ts"): "secoes",
+    ("s", "st"): "secoes_totalizadas",
+    ("s", "pstn"): "pct_secoes_totalizadas",
+    ("e", "te"): "eleitorado",
+    ("e", "est"): "eleitorado_totalizado",
+    ("e", "c"): "comparecimento",
+    ("e", "a"): "abstencao",
+    ("v", "tv"): "total_votos",
+    ("v", "vv"): "votos_validos",
+    ("v", "vb"): "votos_brancos",
+    ("v", "tvn"): "votos_nulos",
+    ("v", "van"): "votos_anulados",
 }
 
 CAMPOS_CANDIDATO = {
     "seq": "seq",
     "sqcand": "sq_candidato",
     "n": "numero",
-    "nm": "nome",
-    "cc": "coligacao",
+    "nmu": "nome",
+    "nm": "nome_completo",
     "e": "eleito",
     "st": "situacao",
     "dvt": "destino_voto",
     "vap": "votos",
-    "pvap": "pct_votos_validos",
+    "pvapn": "pct_votos_validos",
 }
+CAMPOS_NUMERICOS = {"votos", "pct_votos_validos"}
 
 
 def to_number(valor: Any) -> float:
-    """Converte "1.234", "48,43" ou "" do TSE para float (NaN se vazio)."""
+    """Converte "1.234", "47,027" ou "" do TSE para float (NaN se vazio)."""
     if valor is None:
         return math.nan
     if isinstance(valor, (int, float)):
@@ -100,20 +98,20 @@ class Eleicao:
     def sufixo(self) -> str:
         return f"e{self.codigo:06d}"
 
+    def _dados(self, uf: str, base: str) -> str:
+        return f"{base}/{self.ciclo}/{self.codigo}/dados/{uf.lower()}"
+
     def url_municipios(self, base: str = BASE_URL) -> str:
         return f"{base}/{self.ciclo}/{self.codigo}/config/mun-{self.sufixo}-cm.json"
 
-    def url_resultado(self, abrangencia: str, cargo: int = CARGO_PRESIDENTE, base: str = BASE_URL) -> str:
-        """URL do arquivo simplificado.
+    def url_progresso(self, uf: str, base: str = BASE_URL) -> str:
+        """Progresso da apuração por município de uma UF ("-ab.json")."""
+        return f"{self._dados(uf, base)}/{uf.lower()}-{self.sufixo}-ab.json"
 
-        `abrangencia`: "br", uma UF ("sp", "zz") ou UF + código TSE do município ("sp71072").
-        """
+    def url_resultado(self, abrangencia: str, cargo: int = CARGO_PRESIDENTE, base: str = BASE_URL) -> str:
+        """`abrangencia`: "br", uma UF ("sp", "zz") ou UF + código TSE do município ("sp71072")."""
         abrangencia = abrangencia.lower()
-        uf = abrangencia[:2]
-        return (
-            f"{base}/{self.ciclo}/{self.codigo}/dados-simplificados/{uf}/"
-            f"{abrangencia}-c{cargo:04d}-{self.sufixo}-r.json"
-        )
+        return f"{self._dados(abrangencia[:2], base)}/{abrangencia}-c{cargo:04d}-{self.sufixo}-u.json"
 
 
 def url_config(base: str = BASE_URL) -> str:
@@ -125,8 +123,19 @@ def url_config(base: str = BASE_URL) -> str:
 # ---------------------------------------------------------------------------
 
 
-def parse_resultado(payload: dict) -> tuple[dict, list[dict]]:
-    """Separa um "-r.json" em (totais da abrangência, lista de candidatos)."""
+def _iter_candidatos(payload: dict, cargo: int | None) -> Iterator[dict]:
+    """Candidatos ficam em carg[].agr[] (coligação/partido isolado) -> par[] -> cand[]."""
+    for carg in payload.get("carg", []) or []:
+        if cargo is not None and str(carg.get("cd")) != str(cargo):
+            continue
+        for agr in carg.get("agr", []) or []:
+            for par in agr.get("par", []) or []:
+                for cand in par.get("cand", []) or []:
+                    yield {**cand, "_partido": par.get("sg"), "_agremiacao": agr.get("nm")}
+
+
+def parse_resultado(payload: dict, cargo: int | None = None) -> tuple[dict, list[dict]]:
+    """Separa um "-u.json" em (totais da abrangência, lista de candidatos)."""
     totais: dict[str, Any] = {
         "eleicao": payload.get("ele"),
         "tipo_abrangencia": payload.get("tpabr"),
@@ -136,19 +145,40 @@ def parse_resultado(payload: dict) -> tuple[dict, list[dict]]:
         "hora_geracao": payload.get("hg"),
         "data_totalizacao": payload.get("dt"),
         "hora_totalizacao": payload.get("ht"),
+        "totalizacao_final": payload.get("tf"),
         "matematicamente_definida": payload.get("md"),
     }
-    for chave, nome in CAMPOS_TOTAIS.items():
-        totais[nome] = to_number(payload.get(chave))
+    for (bloco, chave), nome in CAMPOS_TOTAIS.items():
+        totais[nome] = to_number((payload.get(bloco) or {}).get(chave))
 
     candidatos = []
-    for cand in payload.get("cand", []) or []:
-        linha: dict[str, Any] = {}
-        for chave, nome in CAMPOS_CANDIDATO.items():
-            valor = cand.get(chave)
-            linha[nome] = to_number(valor) if nome in ("votos", "pct_votos_validos") else valor
+    for cand in _iter_candidatos(payload, cargo):
+        linha: dict[str, Any] = {nome: cand.get(chave) for chave, nome in CAMPOS_CANDIDATO.items()}
+        for nome in CAMPOS_NUMERICOS:
+            linha[nome] = to_number(linha[nome])
+        linha["partido"] = cand["_partido"]
+        linha["agremiacao"] = cand["_agremiacao"]
         candidatos.append(linha)
     return totais, candidatos
+
+
+def parse_progresso(payload: dict) -> list[dict]:
+    """Linhas do "-ab.json": uma por abrangência (UF ou município) com o progresso."""
+    linhas = []
+    for abr in payload.get("abr", []) or []:
+        s, e = abr.get("s") or {}, abr.get("e") or {}
+        linhas.append({
+            "tipo_abrangencia": abr.get("tpabr"),
+            "abrangencia": abr.get("cdabr"),
+            "data_totalizacao": abr.get("dt"),
+            "hora_totalizacao": abr.get("ht"),
+            "secoes": to_number(s.get("ts")),
+            "secoes_totalizadas": to_number(s.get("st")),
+            "pct_secoes_totalizadas": to_number(s.get("pstn")),
+            "eleitorado": to_number(e.get("te")),
+            "comparecimento": to_number(e.get("c")),
+        })
+    return linhas
 
 
 def iter_municipios(payload: dict) -> Iterator[dict]:
@@ -161,23 +191,25 @@ def iter_municipios(payload: dict) -> Iterator[dict]:
                 "cd_municipio_tse": str(mu.get("cd")),
                 "cd_municipio_ibge": mu.get("cdi"),
                 "nome": mu.get("nm"),
-                "capital": mu.get("c") == "S",
+                "capital": str(mu.get("c", "")).lower() == "s",
                 "zonas": ",".join(mu.get("z", []) or []),
             }
 
 
 def iter_eleicoes(config: dict) -> Iterator[dict]:
-    """Extrai as eleições listadas em ele-c.json (pleito, código, turno, data)."""
+    """Extrai as eleições listadas em ele-c.json (ciclo, código, turno, código do 2T)."""
     for pleito in config.get("pl", []) or []:
         for ele in pleito.get("e", []) or []:
+            cargos = [cp.get("ds") for abr in ele.get("abr", []) or [] for cp in abr.get("cp", []) or []]
             yield {
+                "ciclo": pleito.get("c"),
                 "pleito": pleito.get("cd"),
-                "data": pleito.get("dt") or ele.get("dt"),
+                "data": pleito.get("dt"),
                 "eleicao": ele.get("cd"),
                 "turno": ele.get("t"),
-                "tipo": ele.get("tp"),
-                "nome": ele.get("nm") or ele.get("nmabr"),
-                "bruto": json.dumps(ele, ensure_ascii=False),
+                "eleicao_2t": ele.get("cdt2"),
+                "nome": ele.get("nm"),
+                "cargos": ", ".join(dict.fromkeys(c for c in cargos if c)),
             }
 
 
@@ -198,8 +230,10 @@ class ClienteTSE:
         self._sem: asyncio.Semaphore | None = None
         self._concorrencia = concorrencia
         self._validadores: dict[str, dict[str, str]] = {}
+        self._timeout = timeout
         self._http = httpx.AsyncClient(
             timeout=timeout,
+            limits=httpx.Limits(max_connections=concorrencia, max_keepalive_connections=concorrencia),
             follow_redirects=True,
             headers={"User-Agent": "deolhonovoto/0.1 (+https://github.com/HenriqueMessias/deolhonovoto)"},
         )
@@ -225,7 +259,9 @@ class ClienteTSE:
         for tentativa in range(tentativas):
             try:
                 async with self._sem:
-                    resp = await self._http.get(url, headers=headers)
+                    # prazo total: o timeout do httpx é por operação e não pega
+                    # conexões que ficam pingando bytes ou presas no pool
+                    resp = await asyncio.wait_for(self._http.get(url, headers=headers), self._timeout)
                 if resp.status_code == 304:
                     return None, False
                 if resp.status_code == 404:
@@ -236,7 +272,7 @@ class ClienteTSE:
                                       ("last-modified", resp.headers.get("last-modified"))) if v
                 }
                 return resp.json(), True
-            except (httpx.TransportError, httpx.HTTPStatusError):
+            except (httpx.TransportError, httpx.HTTPStatusError, asyncio.TimeoutError):
                 if tentativa == tentativas - 1:
                     raise
                 await asyncio.sleep(espera)
@@ -251,18 +287,31 @@ class ClienteTSE:
         payload, _ = await self.get_json(eleicao.url_municipios(self.base))
         return list(iter_municipios(payload or {}))
 
+    async def progresso(self, eleicao: Eleicao, ufs: Iterable[str]) -> list[tuple[str, dict]]:
+        """Baixa os "-ab.json" das UFs; devolve só os que mudaram."""
+        ufs = list(ufs)
+        respostas = await asyncio.gather(
+            *(self.get_json(eleicao.url_progresso(uf, self.base)) for uf in ufs), return_exceptions=True
+        )
+        return [(uf, r[0]) for uf, r in zip(ufs, respostas)
+                if not isinstance(r, BaseException) and r[0] is not None]
+
     async def resultados(
         self, eleicao: Eleicao, abrangencias: Iterable[str], cargo: int = CARGO_PRESIDENTE
-    ) -> list[tuple[str, dict]]:
-        """Baixa em paralelo vários "-r.json"; devolve só os que mudaram."""
+    ) -> tuple[list[tuple[str, dict]], list[str]]:
+        """Baixa em paralelo vários "-u.json".
+
+        Retorna (arquivos que mudaram, abrangências que falharam após as retentativas).
+        """
         abrangencias = list(abrangencias)
         urls = [eleicao.url_resultado(a, cargo, self.base) for a in abrangencias]
         respostas = await asyncio.gather(*(self.get_json(u) for u in urls), return_exceptions=True)
-        saida = []
+        saida, falhas = [], []
         for abr, resp in zip(abrangencias, respostas):
             if isinstance(resp, BaseException):
+                falhas.append(abr)
                 continue
             payload, mudou = resp
             if payload is not None and mudou:
                 saida.append((abr, payload))
-        return saida
+        return saida, falhas
